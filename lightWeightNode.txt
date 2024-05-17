@@ -1,0 +1,302 @@
+import Crypto
+import Crypto.Random
+from Crypto.PublicKey import RSA
+from Crypto.Signature import PKCS1_v1_5
+from Crypto.Hash import SHA
+import binascii
+import json
+import requests
+from flask import Flask, jsonify, request
+from urllib.parse import urlparse
+import datetime
+import hashlib
+from datetime import datetime
+
+app = Flask(__name__)
+
+#sha 256 fucntion
+def sha256(message):
+    encoded_message = str(message).encode('ascii')
+    hashed_output = hashlib.sha256(encoded_message)
+    return hashed_output
+
+#function of getting merkleroot from the transactions list
+def get_merkleroot(input):
+    tempList = []
+    tempStr = ""
+    for transaction in input: #tr
+        tempList.append(sha256(transaction).hexdigest())
+
+    while True:
+        tempList2 = tempList
+        tempList = []
+        for i in range(len(tempList2)):
+            tempStr = tempStr + tempList2[i]
+            if ((i + 1) % 2 == 0) or (i == (len(tempList2) - 1)):
+                tempList.append(sha256(tempStr).hexdigest())
+                tempStr = ""
+        if len(tempList) == 1:
+            return tempList[0]
+
+#function to get the merkleroot from the merkle path and the transaction
+def pathToRoot(transaction, merklePath):
+    temp = sha256(transaction).hexdigest()
+    for i in range(len(merklePath)):
+        if merklePath[i][0] == "0":  #if the merkle number is 0, its mean the hash value is on the left hand side of the transaction
+            temp = merklePath[i][1] + temp
+        elif merklePath[i][0] == "1":  #if the merkle number is 1, its mean the hash value is on the right hand side of the transaction
+            temp = temp + merklePath[i][1]
+        temp = sha256(temp).hexdigest() #if the merkle number is 2, its mean the no hash value on both side of the transaction, the temp need to hash itself again
+    return temp
+
+#function of gettign nonce according to the difficulty
+def getNonce(message, diff):
+    nonce = 0
+    prefix = '0' * diff
+    while (True):
+        hashed_result = sha256(str(nonce) + message)
+        if (hashed_result.startswith(prefix) == True):
+            return nonce
+        nonce = nonce + 1
+
+
+class Transaction:
+    def __init__(self, sender, recipient, value, transaction_fee, timestamp, signature=0):
+        self.sender = sender #sender of the transaction
+        self.recipient = recipient #recipient of the transaction
+        self.value = value #value of the transaction
+        self.transaction_fee = transaction_fee #transaction fee of the transaction
+        self.signature = signature #signature of the transaction
+        self.timestamp = timestamp #timestamp of the transaction
+
+    #function return the sender
+    def get_sender(self):
+        return self.sender
+
+    #function return the recipient
+    def get_recipient(self):
+        return self.recipient
+
+    #function return the class dictionary to string format
+    def to_dict(self):
+        return ({'sender': self.sender, 'recipient': self.recipient, 'transaction_fee': self.transaction_fee,
+                 'value': self.value, 'timestamp': self.timestamp})
+
+    #function of add signature to the transaction
+    def add_signature(self, signature):
+        self.signature = signature
+
+    #function of verify the transaction with signature
+    def verify_transaction_signature(self):
+        if hasattr(self, 'signature'):
+            public_key = RSA.importKey(binascii.unhexlify(self.sender))
+            verifier = PKCS1_v1_5.new(public_key)
+            h = SHA.new(str(self.to_dict()).encode('utf8'))
+            return verifier.verify(h, binascii.unhexlify(self.signature))
+        else:
+            return False
+
+    #function to return the dictionary of the class variable as a string
+    def to_json(self):
+        return json.dumps(self.__dict__, sort_keys=False)
+
+class Wallet:
+    def __init__(self, type):
+        random = Crypto.Random.new().read
+        self._private_key = RSA.generate(1024, random) #private key of the wallet
+        self._public_key = self._private_key.publickey() #public key of the wallet
+        self.type = type #type of the wallet
+
+    #function of signing the transaction
+    def sign_transaction(self, transaction: Transaction):
+        signer = PKCS1_v1_5.new(self._private_key)
+        h = SHA.new(str(transaction.to_dict()).encode('utf8'))
+        return binascii.hexlify(signer.sign(h)).decode('ascii')
+
+    #function of return the public key as a class variable
+    @property
+    def identity(self):
+        pubkey = binascii.hexlify(self._public_key.exportKey(format='DER'))
+        return pubkey.decode('ascii')
+
+    #function of return the private key as a class variable
+    @property
+    def privateIndentity(self):
+        prikey = binascii.hexlify(self._private_key.exportKey(format='DER'))
+        return prikey.decode('ascii')
+
+class Block:
+    def __init__(self, index, difficulty, timestamp, previous_hash, merkleRoot, hash=0, nonce=0):
+        self.index = index #the index of the block
+        self.timestamp = timestamp #the timestamp when the block being mine
+        self.previous_hash = previous_hash #the hash value of the previous block
+        self.hash = hash #hash value of the block
+        self.nonce = nonce #nonce of the block
+        self.difficulty = difficulty #difficulty of the block
+        self.merkleRoot = merkleRoot #merkle root fo the transactions inside the block
+
+    #return the class variable to string form
+    def to_dict(self):
+        return (
+        {'index': self.index, 'difficulty': self.difficulty, 'timestamp': self.timestamp, 'merkleRoot': self.merkleRoot,
+         'previous_hash': self.previous_hash, 'nonce': self.nonce})
+
+    #return the class dictionary to json form string
+    def to_json(self):
+        return json.dumps(self.__dict__)
+
+    #function return the hash value of the block
+    def compute_hash(self):
+        return sha256(str(self.to_dict()).encode()).hexdigest()
+
+
+nodes = set() #neighbour nodes list of the current node
+unconfirmed_transaction = [] #unconfirmed transaction of the lightweight ndoe
+confirmed_transaction = [] #confirmed transaction of the confirmed transaction
+
+#function that get itself balance by sending balance request of the full node neighbours
+def balance():
+    myobj = {'address': myWallet.identity}
+    neighbours = nodes
+    for node in neighbours:
+        response = requests.get('http://' + node + '/type')
+        if response.status_code == 200:
+            if response.json()['type'] == "Full Node":
+                response = requests.post('http://' + node + '/balanceOfAddress', data=myobj)
+                response = response.json()['balance']
+                return response
+    return -1
+
+#function that register the node to the neighbour nodes list
+def registerNode(node_url):
+    parsed_url = urlparse(node_url)
+    if parsed_url.netloc:
+        nodes.add(parsed_url.netloc)
+    elif parsed_url.path:
+        nodes.add(parsed_url.path)
+    else:
+        raise ValueError('Invalid URL')
+
+#function that get balance of the lightweight wallet
+@app.route('/getBalance', methods=['GET'])
+def getBalance():
+    myBalance = balance() #call the function of getting the balance
+    if myBalance == -1: #if the balance return -1 but not the real balance, it mean no full node is connected
+        return jsonify("No full node connected"), 400
+    else:
+        response = {'balance': myBalance, }
+        return jsonify(response), 200
+
+#function of submit a new transaction, as the lightnode cannot add the transaction to the block itself, it will submit the transaction the full node
+@app.route('/new_transaction', methods=['POST'])
+def new_transaction():
+    values = request.form
+    required = ['recipient_address', 'amount']
+    if not all(k in values for k in required):
+        return 'Missing values', 400
+    myBalance = balance()
+    if myBalance == -1:
+        return jsonify("No full node connected"), 400
+    if (float(values['amount']) + 0.00001) > float(myBalance):
+        return 'Not Enough Balance', 400
+    transaction = Transaction(myWallet.identity, values['recipient_address'], values['amount'], "0.00001",
+                              datetime.now().timestamp())
+    transaction.add_signature(myWallet.sign_transaction(transaction))
+    myobj = {'transaction': transaction.to_json()}
+    neighbours = nodes
+    for node in neighbours:
+        response = requests.post('http://' + node + '/spv', data= myobj)
+        if response.status_code == 200:
+            response = {'message': 'Transaction will be added to Block '}
+            unconfirmed_transaction.append(transaction.to_json())
+            return jsonify(response), 200
+        if response.status_code == 400:
+            response = {'message': 'Invalid Transaction'}
+            return jsonify(response), 201
+    return jsonify("No full node connected"), 400
+
+#function return the transaction fee that need to pay for making a transaction
+@app.route('/transaction_fee', methods=['GET'])
+def transaction_fee():
+    response = {'transaction_fee': "0.00001", }
+    return jsonify(response), 200
+
+#function return the type of the wallet
+@app.route('/type', methods=['GET'])
+def type():
+    response = {'type': myWallet.type, }
+    return jsonify(response), 200
+
+#function return the public address of the wallet
+@app.route('/myWallet', methods=['GET'])
+def myWallet():
+    response = {'publicKey': myWallet.identity, }
+    return jsonify(response), 200
+
+#function return the list of negibour list
+@app.route('/get_nodes', methods=['GET'])
+def get_nodes():
+    node = list(nodes)
+    response = {'nodes': node}
+    return jsonify(response), 200
+
+#function of register other node as a neighbour and put them into the list
+@app.route('/register_node', methods=['POST'])
+def register_node():
+    values = request.form
+    node = values.get('node')
+    com_port = values.get('com_port')
+    if com_port is not None:
+        registerNode(request.remote_addr + ":" + com_port)
+        return "ok", 200
+    if node is None and com_port is None:
+        return "Error: Please supply a valid nodes", 400
+    registerNode(node)
+    node_list = requests.get('http://' + node + '/get_nodes')
+    if node_list.status_code == 200:
+        node_list = node_list.json()['nodes']
+        for node in node_list:
+            registerNode(node)
+    for new_nodes in nodes:
+        requests.post('http://' + new_nodes + '/register_node', data={'com_port': str(port)})
+    response = {'message': 'A full node is connected',
+                'total_nodes': [node for node in nodes]}
+
+    return jsonify(response), 201
+
+#function of consensus the status of each transaction in its unconfirmed transaction list
+@app.route('/consensus', methods=['GET'])
+def consensus():
+    temp = []
+    for node in nodes:
+        response = requests.get('http://' + node + '/type')
+        if response.status_code == 200:
+            if response.json()['type'] == "Full Node":  #only send request to the full node
+                for transaction in unconfirmed_transaction: #loop throw all its unconfirmed transaction
+                    myobj = {'transaction': transaction}
+                    response = requests.post('http://' + node + '/getMerklePath', data=myobj) #get the merklepath from the full node
+                    if response.status_code == 200:
+                        merklePath = json.loads(response.json()['merkle_path'])
+                        merkleRoot = pathToRoot(transaction, merklePath) #get the merkle root with the merkle path and the transaction
+                        myobj2 = {'index': int(response.json()['index'])}
+                        response2 = requests.post('http://' + node + '/getHeader', data=myobj2) #get the coorsponding header from the full node
+                        if response2.status_code == 200:
+                            checkRoot = response2.json()['merkleRoot'] #get the merkleroot from the header to checking
+                            if checkRoot == merkleRoot: #if the two root are same, it mean the transaction correctly added into the blockchain
+                                unconfirmed_transaction.remove(transaction) #move the transaction from unconfirmed to confirmed
+                                confirmed_transaction.append(transaction)
+                return jsonify("ok"), 200
+    return jsonify("No full node connected"), 400
+
+#get the transaction sent by the lightweight node itself and see their status
+@app.route('/myTransaction', methods=['GET'])
+def myTransaction():
+    consensus()
+    response = {'unconfirmed_transaction': json.dumps(unconfirmed_transaction),
+                'confirmed_transaction': json.dumps(confirmed_transaction)}
+    return jsonify(response), 200
+
+if __name__ == '__main__':
+    myWallet = Wallet("Lightweight Node") #create a wallet with lightweight ndoe
+    port = 5004
+    app.run(host='192.168.0.109', port=port)
